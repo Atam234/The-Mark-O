@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="tl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>MarkOlama</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#0b0e1a">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Bangers&family=Rajdhani:wght@600;700&display=swap" rel="stylesheet">
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#000;overflow:hidden;
+    font-family:'Rajdhani',sans-serif; -webkit-user-select:none; user-select:none;}
+  #wrap{position:relative;width:100%;max-width:960px;aspect-ratio:16/9;margin:0 auto;
+    background:#000;touch-action:none;}
+  canvas{width:100%;height:100%;display:block;touch-action:none;}
+  #wrap.fallback{height:56.25vw;max-height:100vh;}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="960" height="540"></canvas></div>
+<script>
+'use strict';
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const wrap = document.getElementById('wrap');
+if(!CSS.supports('aspect-ratio','16/9')) wrap.classList.add('fallback');
+
+/* ---------- palette / theme ---------- */
+const PAL = {
+  skyTop:'#0b0e1a', skyHorizon:'#3a2a55', groundFar:'#5a4636', ground:'#3c2c22',
+  groundLine:'#6b4f38', pOrange:'#ff7a1a', pDark:'#1b3a6b', eDark:'#232323',
+  eRed:'#d63447', ki:'#38bdf8', gold:'#ffd23f', panel:'rgba(8,10,18,0.78)'
+};
+
+/* ---------- input ---------- */
+const pointers = new Map(); // pointerId -> {mode:'joy'|'btn', btn}
+const joy = {baseX:110, baseY:460, r:78, active:false, dx:0, dy:0, jumpLatched:false};
+const buttons = [
+  {id:'kick',  x:848, y:492, r:34, label:'KICK', color:'#ffb84d'},
+  {id:'punch', x:768, y:452, r:38, label:'PUNCH', color:'#ff8a3d'},
+  {id:'ki',    x:900, y:420, r:30, label:'KI', color:PAL.ki},
+  {id:'special', x:812, y:368, r:44, label:'SPECIAL', color:PAL.gold}
+];
+
+function toCanvasXY(clientX, clientY){
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: (clientX - rect.left) * (canvas.width/rect.width),
+    y: (clientY - rect.top) * (canvas.height/rect.height)
+  };
+}
+function dist(x1,y1,x2,y2){ return Math.hypot(x1-x2,y1-y2); }
+
+canvas.addEventListener('pointerdown', e=>{
+  canvas.setPointerCapture(e.pointerId);
+  const {x,y} = toCanvasXY(e.clientX, e.clientY);
+  if(state.phase==='start'){ startCountdown(); return; }
+  if(state.phase==='over'){ resetMatch(); startCountdown(); return; }
+  if(state.phase!=='battle') return;
+  if(dist(x,y,joy.baseX,joy.baseY) <= joy.r + 20){
+    pointers.set(e.pointerId,{mode:'joy'});
+    joy.active = true; joy.dx=0; joy.dy=0;
+    return;
+  }
+  for(const b of buttons){
+    if(dist(x,y,b.x,b.y) <= b.r + 6){
+      pointers.set(e.pointerId,{mode:'btn', btn:b.id});
+      pressButton(b.id);
+      return;
+    }
+  }
+});
+canvas.addEventListener('pointermove', e=>{
+  const p = pointers.get(e.pointerId);
+  if(!p || p.mode!=='joy') return;
+  const {x,y} = toCanvasXY(e.clientX, e.clientY);
+  let dx = x - joy.baseX, dy = y - joy.baseY;
+  const d = Math.hypot(dx,dy);
+  const max = joy.r;
+  if(d > max){ dx = dx/d*max; dy = dy/d*max; }
+  joy.dx = dx/max; joy.dy = dy/max;
+});
+function releasePointer(e){
+  const p = pointers.get(e.pointerId);
+  if(p && p.mode==='joy'){ joy.active=false; joy.dx=0; joy.dy=0; joy.jumpLatched=false; }
+  pointers.delete(e.pointerId);
+}
+canvas.addEventListener('pointerup', releasePointer);
+canvas.addEventListener('pointercancel', releasePointer);
+
+/* keyboard fallback (desktop testing) */
+const keys = {};
+window.addEventListener('keydown', e=>{
+  keys[e.key]=true;
+  if(state.phase==='start'){ startCountdown(); return; }
+  if(state.phase==='over'){ resetMatch(); startCountdown(); return; }
+  if(e.key==='z'||e.key==='Z') pressButton('punch');
+  if(e.key==='x'||e.key==='X') pressButton('kick');
+  if(e.key==='c'||e.key==='C') pressButton('ki');
+  if(e.key==='v'||e.key==='V') pressButton('special');
+});
+window.addEventListener('keyup', e=>{ keys[e.key]=false; });
+
+/* ---------- audio (tiny synthesized SFX) ---------- */
+let actx;
+function sfx(type){
+  try{
+    if(!actx) actx = new (window.AudioContext||window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.connect(g); g.connect(actx.destination);
+    const t = actx.currentTime;
+    let f0=200,f1=100,dur=0.12,vol=0.15,wave='square';
+    if(type==='punch'){ f0=180; f1=90; dur=0.09; vol=0.18; }
+    if(type==='kick'){ f0=140; f1=70; dur=0.14; vol=0.2; }
+    if(type==='ki'){ f0=600; f1=900; dur=0.18; vol=0.12; wave='sawtooth'; }
+    if(type==='special'){ f0=120; f1=700; dur=0.5; vol=0.22; wave='sawtooth'; }
+    if(type==='hit'){ f0=300; f1=60; dur=0.1; vol=0.2; }
+    o.type = wave;
+    o.frequency.setValueAtTime(f0,t);
+    o.frequency.exponentialRampToValueAtTime(Math.max(f1,20),t+dur);
+    g.gain.setValueAtTime(vol,t);
+    g.gain.exponentialRampToValueAtTime(0.001,t+dur);
+    o.start(t); o.stop(t+dur);
+  }catch(err){}
+}
+
+/* ---------- fighter factory ---------- */
+function makeFighter(cfg){
+  return {
+    name: cfg.name, isPlayer: cfg.isPlayer, x: cfg.x, y: 460, vx:0, vy:0,
+    facing: cfg.isPlayer? 1 : -1, w:44, h:120, onGround:true,
+    hp:100, maxHp:100, ki:0, maxKi:100,
+    state:'idle', actionTimer:0, actionDur:0, hitChecked:false,
+    hitstun:0, walkPhase:0, transformed:false, flashT:0,
+    accent: cfg.accent, dark: cfg.dark, hair: cfg.hair,
+    aiTimer: 0, guardChance: cfg.guardChance||0
+  };
+}
+
+/* ---------- game state ---------- */
+let state = {};
+function resetMatch(){
+  state = {
+    phase:'start', // start -> countdown -> battle -> over
+    countdown:3, countdownT:0,
+    timer:60, timerAcc:0,
+    p: makeFighter({name:'Goku', isPlayer:true, x:260, accent:PAL.pOrange, dark:PAL.pDark, hair:'#111'}),
+    e: makeFighter({name:'Gohan', isPlayer:false, x:700, accent:PAL.eRed, dark:PAL.eDark, hair:'#111', guardChance:0.18}),
+    particles:[], projectiles:[], texts:[], firstHit:false,
+    shake:0, flash:0, winner:null
+  };
+}
+function startCountdown(){
+  state.phase='countdown'; state.countdown=3; state.countdownT=0;
+}
+resetMatch();
+
+/* ---------- combat helpers ---------- */
+function addParticles(x,y,color,n=10){
+  for(let i=0;i<n;i++){
+    const a = Math.random()*Math.PI*2, sp = 60+Math.random()*160;
+    state.particles.push({x,y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp-40,life:0.4+Math.random()*0.3,age:0,color,r:2+Math.random()*3});
+  }
+}
+function addText(x,y,str,color,size=26){
+  state.texts.push({x,y,str,color,size,age:0,life:1.1});
+}
+function dealDamage(attacker, defender, dmg, kind){
+  let guarded = false;
+  if(!defender.isPlayer && Math.random() < defender.guardChance){ guarded = true; }
+  if(guarded){ dmg *= 0.35; addText(defender.x, defender.y-140, 'BLOCK', '#9ad1ff', 20); }
+  defender.hp = Math.max(0, defender.hp - dmg);
+  defender.hitstun = kind==='special' ? 500 : 220;
+  defender.state = 'hit';
+  defender.actionTimer = defender.hitstun; defender.actionDur = defender.hitstun;
+  const kb = (kind==='special'?14:kind==='ki'?9:6) * (attacker.facing);
+  defender.vx = kb;
+  attacker.ki = Math.min(attacker.maxKi, attacker.ki + (kind==='special'?0:10));
+  state.shake = Math.max(state.shake, kind==='special'?18:8);
+  addParticles(defender.x - defender.facing*10, defender.y-70, kind==='special'?PAL.gold:'#fff', kind==='special'?26:12);
+  sfx('hit');
+  if(!state.firstHit && !guarded){
+    state.firstHit = true;
+    addText(attacker.x, attacker.y-160, 'FIRST ATTACK!', PAL.gold, 30);
+  }
+}
+
+const REACH = {punch:78, kick:92, ki:1000};
+function tryHit(attacker, defender, kind, dmg){
+  const dx = (defender.x - attacker.x) * attacker.facing;
+  const facingRight = defender.x > attacker.x ? 1 : -1;
+  if(facingRight !== attacker.facing) return; // not facing target
+  if(dx > 0 && dx < REACH[kind]) dealDamage(attacker, defender, dmg, kind);
+}
+
+function startAction(f, kind){
+  if(f.actionTimer>0 && f.state!=='idle' && f.state!=='walk') return false;
+  const durs = {punch:260, kick:360, ki:320, special:850};
+  f.state = kind; f.actionDur = durs[kind]; f.actionTimer = durs[kind]; f.hitChecked = false;
+  return true;
+}
+
+function pressButton(id){
+  const f = state.p;
+  if(state.phase!=='battle') return;
+  if(id==='punch'){ if(startAction(f,'punch')) sfx('punch'); }
+  else if(id==='kick'){ if(startAction(f,'kick')) sfx('kick'); }
+  else if(id==='ki'){ if(f.ki>=15 && startAction(f,'ki')){ f.ki-=15; sfx('ki'); } }
+  else if(id==='special'){ if(f.ki>=f.maxKi && startAction(f,'special')){ f.ki=0; sfx('special'); } }
+}
+
+/* ---------- AI ---------- */
+function updateAI(f, target, dt){
+  f.aiTimer -= dt;
+  const distX = target.x - f.x;
+  f.facing = distX >= 0 ? 1 : -1;
+  const absD = Math.abs(distX);
+  if(f.actionTimer>0 && f.state!=='idle' && f.state!=='walk') { f.vx = 0; return; }
+  if(f.aiTimer > 0){ return; }
+  f.aiTimer = 0.25 + Math.random()*0.4;
+  if(absD > 260){
+    f.vx = 150 * Math.sign(distX);
+    if(f.ki>=15 && Math.random()<0.3) startAction(f,'ki');
+  } else if(absD > 105){
+    f.vx = 90 * Math.sign(distX);
+    if(f.ki>=f.maxKi && Math.random()<0.4) startAction(f,'special');
+    else if(f.ki>=15 && Math.random()<0.25) startAction(f,'ki');
+  } else {
+    f.vx = 0;
+    if(f.ki>=f.maxKi && Math.random()<0.35) startAction(f,'special');
+    else if(Math.random()<0.55) startAction(f, Math.random()<0.5?'punch':'kick');
+    else if(Math.random()<0.2 && f.onGround) f.vy = -420;
+  }
+}
+
+/* ---------- physics/update ---------- */
+const GROUND_Y = 460, GRAVITY = 1400, MOVE_SPEED = 220, JUMP_V = -480;
+function updateFighter(f, dt, isPlayer){
+  if(isPlayer){
+    let vx = 0;
+    if(joy.active && Math.abs(joy.dx) > 0.18) vx = joy.dx * MOVE_SPEED;
+    if(keys['ArrowLeft']) vx = -MOVE_SPEED;
+    if(keys['ArrowRight']) vx = MOVE_SPEED;
+    const wantJump = (joy.active && joy.dy < -0.6 && !joy.jumpLatched) || keys['ArrowUp'];
+    if(f.actionTimer<=0 || f.state==='idle' || f.state==='walk'){
+      f.vx = vx;
+      if(f.vx>10) f.facing = state.e.x > f.x ? f.facing : 1, f.facing = 1;
+      if(f.vx<-10) f.facing = -1;
+      if(f.vx>10) f.facing = 1;
+      if(wantJump && f.onGround){ f.vy = JUMP_V; f.onGround=false; joy.jumpLatched = true; }
+      if(joy.dy > -0.3) joy.jumpLatched = false;
+      f.state = Math.abs(f.vx)>10 ? 'walk' : 'idle';
+    }
+    // always face opponent when idle/walking and stationary-ish ambiguous: keep simple facing by relative pos when not moving
+    if((f.state==='idle') ){ f.facing = state.e.x >= f.x ? 1 : -1; }
+  }
+  // gravity
+  f.vy += GRAVITY*dt;
+  f.y += f.vy*dt;
+  if(f.y >= GROUND_Y){ f.y = GROUND_Y; f.vy=0; f.onGround=true; } else f.onGround=false;
+  // apply horizontal
+  f.x += f.vx*dt;
+  f.x = Math.max(40, Math.min(920, f.x));
+  if(!isPlayer || f.state==='hit'){ /* friction on knockback */ f.vx *= 0.9; }
+  f.walkPhase += dt*10;
+
+  // action timer
+  if(f.actionTimer>0){
+    f.actionTimer -= dt*1000;
+    const progress = 1 - f.actionTimer/f.actionDur;
+    if(!f.hitChecked){
+      if(f.state==='punch' && progress>0.45){ tryHit(f, f===state.p?state.e:state.p, 'punch', 6); f.hitChecked=true; }
+      if(f.state==='kick' && progress>0.5){ tryHit(f, f===state.p?state.e:state.p, 'kick', 9); f.hitChecked=true; }
+      if(f.state==='ki' && progress>0.4){
+        f.hitChecked = true;
+        state.projectiles.push({x:f.x + f.facing*40, y:f.y-90, vx:520*f.facing, owner:f, r:10});
+      }
+      if(f.state==='special' && progress>0.55){
+        f.hitChecked = true;
+        const target = f===state.p ? state.e : state.p;
+        const dx = (target.x - f.x)*f.facing;
+        state.flash = 0.35;
+        if(dx>0 && dx<650 && ((target.x>f.x)===(f.facing>0))) dealDamage(f, target, 30, 'special');
+        addParticles(f.x + f.facing*60, f.y-90, PAL.gold, 30);
+      }
+    }
+    if(f.actionTimer<=0){
+      f.actionTimer=0;
+      f.state = 'idle';
+    }
+  }
+}
+
+function update(dt){
+  if(state.shake>0) state.shake = Math.max(0, state.shake - dt*40);
+  if(state.flash>0) state.flash = Math.max(0, state.flash - dt);
+
+  if(state.phase==='countdown'){
+    state.countdownT += dt;
+    if(state.countdownT >= 0.8){ state.countdownT=0; state.countdown--; }
+    if(state.countdown < 0) state.phase='battle';
+    return;
+  }
+  if(state.phase!=='battle') return;
+
+  state.timerAcc += dt;
+  if(state.timerAcc>=1){ state.timerAcc-=1; state.timer = Math.max(0,state.timer-1); }
+
+  updateAI(state.e, state.p, dt);
+  updateFighter(state.p, dt, true);
+  updateFighter(state.e, dt, false);
+  // passive ki regen
+  state.p.ki = Math.min(state.p.maxKi, state.p.ki + dt*4);
+  state.e.ki = Math.min(state.e.maxKi, state.e.ki + dt*4);
+
+  // projectiles
+  for(const pr of state.projectiles){
+    pr.x += pr.vx*dt;
+    const target = pr.owner===state.p ? state.e : state.p;
+    if(Math.abs(pr.x-target.x)<34 && Math.abs((target.y-90)-pr.y)<60){
+      dealDamage(pr.owner, target, 12, 'ki');
+      pr.dead = true;
+    }
+    if(pr.x<0||pr.x>960) pr.dead = true;
+  }
+  state.projectiles = state.projectiles.filter(p=>!p.dead);
+
+  // particles
+  for(const pt of state.particles){
+    pt.age += dt; pt.x += pt.vx*dt; pt.y += pt.vy*dt; pt.vy += 500*dt;
+  }
+  state.particles = state.particles.filter(p=>p.age<p.life);
+  for(const t of state.texts){ t.age += dt; t.y -= dt*30; }
+  state.texts = state.texts.filter(t=>t.age<t.life);
+
+  if(state.p.hp<=0 || state.e.hp<=0 || state.timer<=0){
+    state.phase='over';
+    if(state.p.hp<=0 && state.e.hp<=0) state.winner='DRAW';
+    else if(state.p.hp<=0) state.winner=state.e.name;
+    else if(state.e.hp<=0) state.winner=state.p.name;
+    else state.winner = state.p.hp>=state.e.hp ? state.p.name : state.e.name;
+  }
+}
+
+/* ---------- drawing ---------- */
+function drawBackground(){
+  const g = ctx.createLinearGradient(0,0,0,360);
+  g.addColorStop(0,PAL.skyTop); g.addColorStop(1,PAL.skyHorizon);
+  ctx.fillStyle = g; ctx.fillRect(0,0,960,360);
+  // sun glow
+  const sg = ctx.createRadialGradient(760,110,10,760,110,140);
+  sg.addColorStop(0,'rgba(255,210,120,0.55)'); sg.addColorStop(1,'rgba(255,210,120,0)');
+  ctx.fillStyle=sg; ctx.fillRect(600,0,360,260);
+  // mountains
+  ctx.fillStyle='#241a38';
+  ctx.beginPath(); ctx.moveTo(0,360); ctx.lineTo(120,230); ctx.lineTo(260,360); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(220,360); ctx.lineTo(420,190); ctx.lineTo(600,360); ctx.closePath(); ctx.fill();
+  ctx.fillStyle='#2f2248';
+  ctx.beginPath(); ctx.moveTo(500,360); ctx.lineTo(700,250); ctx.lineTo(960,360); ctx.closePath(); ctx.fill();
+  // ground
+  const gg = ctx.createLinearGradient(0,360,0,540);
+  gg.addColorStop(0,PAL.groundFar); gg.addColorStop(1,PAL.ground);
+  ctx.fillStyle=gg; ctx.fillRect(0,360,960,180);
+  ctx.strokeStyle = PAL.groundLine; ctx.lineWidth=1;
+  for(let i=-4;i<24;i++){
+    ctx.beginPath(); ctx.moveTo(i*60 - 40, 540); ctx.lineTo(i*60-40 + (i*4), 360); ctx.stroke();
+  }
+  ctx.beginPath(); ctx.moveTo(0,362); ctx.lineTo(960,362); ctx.strokeStyle='rgba(255,255,255,0.08)'; ctx.stroke();
+}
+
+function drawFighter(f){
+  ctx.save();
+  ctx.translate(f.x, f.y);
+  ctx.scale(f.facing, 1);
+  const hit = f.state==='hit';
+  const flashOn = hit && Math.floor(f.actionTimer/60)%2===0;
+  const legOff = f.state==='walk' ? Math.sin(f.walkPhase)*14 : 0;
+
+  // shadow
+  ctx.fillStyle='rgba(0,0,0,0.35)';
+  ctx.beginPath(); ctx.ellipse(0,4,30,8,0,0,Math.PI*2); ctx.fill();
+
+  // legs
+  ctx.fillStyle = f.dark;
+  ctx.fillRect(-16, -60, 14, 60+legOff*0.2);
+  ctx.fillRect(2, -60, 14, 60-legOff*0.2);
+
+  // kick pose: extend front leg
+  if(f.state==='kick'){
+    ctx.save();
+    ctx.fillStyle = f.accent;
+    ctx.translate(2,-45);
+    ctx.rotate(-0.9);
+    ctx.fillRect(0,-7,58,14);
+    ctx.restore();
+  }
+
+  // torso
+  ctx.fillStyle = flashOn ? '#ffffff' : f.accent;
+  roundRect(-20,-100,40,44,8); ctx.fill();
+  ctx.fillStyle = f.dark;
+  roundRect(-20,-100,40,16,6); ctx.fill();
+
+  // arms
+  ctx.fillStyle = flashOn ? '#ffffff' : f.accent;
+  if(f.state==='punch'){
+    ctx.fillRect(6,-92,56,13);
+    ctx.fillRect(-24,-92,16,13);
+  } else if(f.state==='ki' || f.state==='special'){
+    ctx.fillRect(2,-88,38,12);
+    ctx.fillRect(2,-70,38,12);
+  } else {
+    ctx.fillRect(-24,-92,16,30);
+    ctx.fillRect(18,-92,16,30);
+  }
+
+  // head
+  ctx.fillStyle = '#f1c27d';
+  ctx.beginPath(); ctx.arc(0,-118,16,0,Math.PI*2); ctx.fill();
+  // hair
+  ctx.fillStyle = f.transformed ? PAL.gold : f.hair;
+  ctx.beginPath();
+  ctx.moveTo(-16,-124);
+  for(let i=0;i<6;i++){
+    const ang = -Math.PI + i*(Math.PI/5);
+    ctx.lineTo(Math.cos(ang)*(22+ (i%2?10:0)), -128 + Math.sin(ang)*(24+(i%2?10:0)));
+  }
+  ctx.lineTo(16,-124); ctx.closePath(); ctx.fill();
+
+  // ki charge glow
+  if(f.state==='ki' || f.state==='special'){
+    const gr = ctx.createRadialGradient(20,-80,2,20,-80,30);
+    gr.addColorStop(0, f.state==='special'?PAL.gold:PAL.ki);
+    gr.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.fillStyle = gr;
+    ctx.beginPath(); ctx.arc(20,-80,30,0,Math.PI*2); ctx.fill();
+  }
+  ctx.restore();
+}
+function roundRect(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+}
+
+function drawSpecialBeam(f){
+  if(f.state!=='special' || f.actionTimer/f.actionDur > 0.55) return;
+  ctx.save();
+  const grad = ctx.createLinearGradient(f.x,0,f.x + f.facing*900,0);
+  grad.addColorStop(0, 'rgba(255,255,255,0.95)');
+  grad.addColorStop(0.3, PAL.gold);
+  grad.addColorStop(1, 'rgba(255,180,60,0)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(f.x, f.y-104, f.facing*900, 22);
+  ctx.restore();
+}
+
+function drawHUD(){
+  // name plates + hp bars
+  drawBar(24, 26, 360, 'Goku (Player)', state.p.hp, state.p.maxHp, true);
+  drawBar(960-24-360, 26, 360, 'Gohan (CPU)', state.e.hp, state.e.maxHp, false);
+  // ki bars
+  drawKi(24, 54, 220, state.p.ki, state.p.maxKi, true);
+  drawKi(960-24-220, 54, 220, state.e.ki, state.e.maxKi, false);
+  // timer
+  ctx.textAlign='center';
+  ctx.font='700 34px Rajdhani';
+  ctx.fillStyle = state.timer<=10 ? '#ff5f5f' : '#fff';
+  ctx.fillText(state.timer, 480, 46);
+  ctx.strokeStyle='rgba(0,0,0,0.6)'; ctx.lineWidth=3;
+  ctx.strokeText(state.timer, 480, 46);
+}
+function drawBar(x,y,w,label,hp,maxHp,leftAlign){
+  ctx.fillStyle = PAL.panel;
+  roundRect(x-2,y-2,w+4,20,6); ctx.fill();
+  const pct = Math.max(0,hp/maxHp);
+  const barGrad = ctx.createLinearGradient(x,0,x+w,0);
+  barGrad.addColorStop(0,'#f87171'); barGrad.addColorStop(0.5,'#fbbf24'); barGrad.addColorStop(1,'#4ade80');
+  ctx.save();
+  ctx.beginPath(); ctx.rect(x,y,w*pct,16); ctx.clip();
+  ctx.fillStyle = barGrad; ctx.fillRect(x,y,w,16);
+  ctx.restore();
+  ctx.strokeStyle='rgba(255,255,255,0.5)'; ctx.lineWidth=1.5; ctx.strokeRect(x,y,w,16);
+  ctx.font='700 15px Rajdhani'; ctx.fillStyle='#fff';
+  ctx.textAlign = leftAlign?'left':'right';
+  ctx.fillText(label, leftAlign?x:x+w, y-6);
+}
+function drawKi(x,y,w,ki,maxKi,leftAlign){
+  const pct = ki/maxKi;
+  ctx.fillStyle='rgba(0,0,0,0.4)'; ctx.fillRect(x,y,w,8);
+  ctx.fillStyle = pct>=1 ? PAL.gold : PAL.ki;
+  ctx.fillRect(leftAlign?x:x+w*(1-pct), y, w*pct, 8);
+  ctx.strokeStyle='rgba(255,255,255,0.4)'; ctx.strokeRect(x,y,w,8);
+}
+
+function drawControls(){
+  // joystick
+  ctx.beginPath(); ctx.arc(joy.baseX,joy.baseY,joy.r,0,Math.PI*2);
+  ctx.fillStyle='rgba(120,200,255,0.15)'; ctx.fill();
+  ctx.strokeStyle='rgba(180,220,255,0.5)'; ctx.lineWidth=2; ctx.stroke();
+  const kx = joy.baseX + joy.dx*joy.r*0.7, ky = joy.baseY + joy.dy*joy.r*0.7;
+  ctx.beginPath(); ctx.arc(kx,ky,34,0,Math.PI*2);
+  ctx.fillStyle='rgba(150,220,255,0.5)'; ctx.fill();
+  ctx.strokeStyle='rgba(220,240,255,0.8)'; ctx.stroke();
+
+  for(const b of buttons){
+    const ready = b.id==='special' ? state.p.ki>=state.p.maxKi : (b.id==='ki'? state.p.ki>=15 : true);
+    ctx.beginPath(); ctx.arc(b.x,b.y,b.r,0,Math.PI*2);
+    ctx.fillStyle = ready ? b.color+'cc' : 'rgba(80,80,80,0.35)';
+    ctx.globalAlpha = ready?0.85:0.5;
+    ctx.fill(); ctx.globalAlpha=1;
+    ctx.strokeStyle='rgba(255,255,255,0.6)'; ctx.lineWidth=2; ctx.stroke();
+    ctx.fillStyle='#fff'; ctx.font='700 13px Rajdhani'; ctx.textAlign='center';
+    ctx.fillText(b.label, b.x, b.y+4);
+  }
+}
+
+function drawParticles(){
+  for(const p of state.particles){
+    ctx.globalAlpha = Math.max(0,1-p.age/p.life);
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,Math.PI*2); ctx.fill();
+  }
+  ctx.globalAlpha=1;
+}
+function drawProjectiles(){
+  for(const pr of state.projectiles){
+    const gr = ctx.createRadialGradient(pr.x,pr.y,1,pr.x,pr.y,12);
+    gr.addColorStop(0,'#fff'); gr.addColorStop(0.5,PAL.ki); gr.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.fillStyle=gr; ctx.beginPath(); ctx.arc(pr.x,pr.y,12,0,Math.PI*2); ctx.fill();
+  }
+}
+function drawTexts(){
+  ctx.textAlign='center';
+  for(const t of state.texts){
+    ctx.globalAlpha = Math.max(0,1-t.age/t.life);
+    ctx.font = `${t.size}px Bangers, sans-serif`;
+    ctx.fillStyle = t.color;
+    ctx.strokeStyle='rgba(0,0,0,0.7)'; ctx.lineWidth=3;
+    ctx.strokeText(t.str,t.x,t.y);
+    ctx.fillText(t.str,t.x,t.y);
+  }
+  ctx.globalAlpha=1;
+}
+
+function drawOverlays(){
+  if(state.phase==='start'){
+    ctx.fillStyle='rgba(0,0,0,0.55)'; ctx.fillRect(0,0,960,540);
+    ctx.textAlign='center';
+    ctx.font="80px Bangers, sans-serif";
+    ctx.fillStyle=PAL.gold; ctx.strokeStyle='#000'; ctx.lineWidth=5;
+    ctx.strokeText('MarkOlama',480,240); ctx.fillText('MarkOlama',480,240);
+    ctx.font="600 24px Rajdhani"; ctx.fillStyle='#fff';
+    ctx.fillText('I-TAP ANG SCREEN PARA MAGSIMULA', 480, 300);
+    ctx.font="500 17px Rajdhani"; ctx.fillStyle='#cfd8ff';
+    ctx.fillText('Kaliwang joystick: galaw / itaas para talon   •   Kanang buttons: atake', 480, 336);
+  }
+  if(state.phase==='countdown'){
+    ctx.fillStyle='rgba(0,0,0,0.25)'; ctx.fillRect(0,0,960,540);
+    ctx.textAlign='center'; ctx.font="120px Bangers, sans-serif";
+    ctx.fillStyle=PAL.gold; ctx.strokeStyle='#000'; ctx.lineWidth=6;
+    const label = state.countdown>0 ? String(state.countdown) : 'FIGHT!';
+    ctx.strokeText(label,480,300); ctx.fillText(label,480,300);
+  }
+  if(state.phase==='over'){
+    ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(0,0,960,540);
+    ctx.textAlign='center';
+    ctx.font="70px Bangers, sans-serif";
+    ctx.fillStyle = PAL.gold; ctx.strokeStyle='#000'; ctx.lineWidth=5;
+    const label = state.winner==='DRAW' ? 'DRAW!' : `${state.winner} WINS!`;
+    ctx.strokeText(label,480,250); ctx.fillText(label,480,250);
+    ctx.font="600 22px Rajdhani"; ctx.fillStyle='#fff';
+    ctx.fillText('I-TAP PARA MAGLARO ULIT', 480, 300);
+  }
+  if(state.flash>0){
+    ctx.fillStyle = `rgba(255,255,255,${state.flash*0.6})`;
+    ctx.fillRect(0,0,960,540);
+  }
+}
+
+function render(){
+  ctx.save();
+  if(state.shake>0){
+    ctx.translate((Math.random()-0.5)*state.shake, (Math.random()-0.5)*state.shake);
+  }
+  drawBackground();
+  drawParticles();
+  drawSpecialBeam(state.p);
+  drawSpecialBeam(state.e);
+  // draw back-to-front by x
+  const order = [state.p, state.e].sort((a,b)=>a.x-b.x);
+  for(const f of order) drawFighter(f);
+  drawProjectiles();
+  drawTexts();
+  ctx.restore();
+  drawHUD();
+  if(state.phase==='battle') drawControls();
+  drawOverlays();
+}
+
+/* ---------- PWA: service worker + fullscreen/landscape on start ---------- */
+if('serviceWorker' in navigator){
+  window.addEventListener('load', ()=>{
+    navigator.serviceWorker.register('service-worker.js').catch(()=>{});
+  });
+}
+function tryFullscreenLandscape(){
+  try{
+    const el = document.documentElement;
+    if(el.requestFullscreen) el.requestFullscreen().catch(()=>{});
+    if(screen.orientation && screen.orientation.lock) screen.orientation.lock('landscape').catch(()=>{});
+  }catch(err){}
+}
+canvas.addEventListener('pointerdown', tryFullscreenLandscape, {once:true});
+
+/* ---------- main loop ---------- */
+let last = performance.now();
+function loop(now){
+  const dt = Math.min(0.033,(now-last)/1000);
+  last = now;
+  update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
